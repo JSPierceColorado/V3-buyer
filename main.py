@@ -1,7 +1,8 @@
-"""V3 S&P 100 buy-the-dip worker: 12:30 PM America/Denver, trading days.
+"""V3.1: Google Sheet dip discovery + persistent 5% trailing-rebound entry.
 
-Read-only Google Sheet signal: column D (Price - SMA200) < 0.
-Alpaca orders use 2% of current buying_power, including any margin.
+Safe staging release: DRY_RUN defaults true. Requires PostgreSQL DATABASE_URL.
+Discovery at/after 12:30 America/Denver once per trading day; monitoring every
+10 minutes while Alpaca says the market is open. Existing V3 screener unchanged.
 """
 from __future__ import annotations
 
@@ -10,269 +11,361 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
-from datetime import date, datetime, time as clock_time, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+import uuid
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+import psycopg2
+import psycopg2.extras
+import requests
+from google.auth.transport.requests import AuthorizedSession
+from google.oauth2 import service_account
+
+LOG = logging.getLogger("v3-trailing-entry")
 DENVER = ZoneInfo("America/Denver")
-DEFAULT_SHEET_ID = "1DEqMtRcCWBA_-HhXiQyUXkWoiC91q146_AkqS_hd4Gk"
-LOG = logging.getLogger("v3-dip-buyer")
+NEW_YORK = ZoneInfo("America/New_York")
+D = Decimal
+TRIGGER = D("1.05")
+INTERVAL_SECONDS = 600
 
 
-@dataclass(frozen=True)
-class Settings:
-    key: str
-    secret: str
-    service_account_json: str
-    sheet_id: str
-    tab: str
-    paper: bool
-    dry_run: bool
-    buy_fraction: Decimal
+def flag(name, default):
+    value = os.getenv(name, str(default)).strip().lower()
+    if value not in ("true", "false", "1", "0"):
+        raise ValueError(f"{name} must be boolean")
+    return value in ("true", "1")
 
 
-def boolean(name: str, default: bool) -> bool:
-    raw = os.getenv(name, str(default)).strip().lower()
-    if raw not in ("true", "false", "1", "0"):
-        raise ValueError(f"{name} must be true or false")
-    return raw in ("true", "1")
-
-
-def load_settings() -> Settings:
-    cfg = Settings(
-        key=os.getenv("APCA_API_KEY_ID", "").strip(),
-        secret=os.getenv("APCA_API_SECRET_KEY", "").strip(),
-        service_account_json=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip(),
-        sheet_id=os.getenv("GOOGLE_SPREADSHEET_ID", DEFAULT_SHEET_ID).strip(),
-        tab=os.getenv("GOOGLE_SHEET_TAB", "Screener").strip(),
-        paper=boolean("ALPACA_PAPER", True),
-        dry_run=boolean("DRY_RUN", True),
-        buy_fraction=Decimal(os.getenv("BUY_FRACTION", "0.02")),
-    )
-    if not all((cfg.key, cfg.secret, cfg.service_account_json, cfg.sheet_id, cfg.tab)):
-        raise ValueError("Set APCA_API_KEY_ID, APCA_API_SECRET_KEY and GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not cfg.buy_fraction.is_finite() or not Decimal("0") < cfg.buy_fraction <= Decimal("0.02"):
-        raise ValueError("BUY_FRACTION must be greater than zero and no more than 0.02")
-    # Avoid accidental real-money orders caused by changing only one environment setting.
-    if not cfg.paper and not cfg.dry_run and os.getenv("LIVE_TRADING_ACK") != "I_ACCEPT_LIVE_MARGIN_RISK":
-        raise ValueError("Live trading also requires LIVE_TRADING_ACK=I_ACCEPT_LIVE_MARGIN_RISK")
+def settings():
+    cfg = {
+        "key": os.environ["APCA_API_KEY_ID"],
+        "secret": os.environ["APCA_API_SECRET_KEY"],
+        "service_json": os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"],
+        "sheet_id": os.environ["GOOGLE_SPREADSHEET_ID"],
+        "tab": os.getenv("GOOGLE_SHEET_TAB", "Screener"),
+        "database_url": os.environ["DATABASE_URL"],
+        "paper": flag("ALPACA_PAPER", True),
+        "dry_run": flag("DRY_RUN", True),
+        "fraction": D(os.getenv("BUY_FRACTION", "0.02")),
+        "feed": os.getenv("ALPACA_DATA_FEED", "iex").lower(),
+        "cooldown_hours": int(os.getenv("REENTRY_COOLDOWN_HOURS", "24")),
+    }
+    if not cfg["fraction"].is_finite() or not D("0") < cfg["fraction"] <= D("0.02"):
+        raise ValueError("BUY_FRACTION must be in (0, 0.02]")
+    if cfg["feed"] not in ("iex", "sip"):
+        raise ValueError("ALPACA_DATA_FEED must be iex or sip")
+    if cfg["cooldown_hours"] < 0:
+        raise ValueError("REENTRY_COOLDOWN_HOURS must be nonnegative")
+    if not cfg["paper"] and not cfg["dry_run"] and os.getenv("LIVE_TRADING_ACK") != "I_ACCEPT_LIVE_MARGIN_RISK":
+        raise ValueError("Live orders require LIVE_TRADING_ACK=I_ACCEPT_LIVE_MARGIN_RISK")
     return cfg
 
 
-def next_cycle(now: datetime) -> datetime:
-    """Next weekday at 12:30 Denver time (local clock, DST-aware)."""
-    local = now.astimezone(DENVER)
-    for offset in range(8):
-        day = local.date() + timedelta(days=offset)
-        if day.weekday() > 4:
-            continue
-        due = datetime.combine(day, clock_time(12, 30), tzinfo=DENVER)
-        if due > local:
-            return due
-    raise RuntimeError("No upcoming weekday")
-
-
-def parse_decimal(value: object) -> Decimal | None:
-    try:
-        result = Decimal(str(value))
-        return result if result.is_finite() else None
-    except (ValueError, InvalidOperation, TypeError):
-        return None
-
-
-def ticker(value: object) -> str:
+def sym(value):
     return str(value or "").strip().upper().replace("/", ".")
 
 
-def negative_dips(rows: list[list]) -> list[tuple[str, Decimal]]:
-    """Preserve sheet row order; ignore headers, empty rows and invalid D results."""
-    if not rows or len(rows[0]) < 3:
-        raise ValueError("V3 Sheet missing expected header row")
-    h = [str(c).strip().lower() for c in rows[0]]
-    if h[:3] != ["symbol", "price", "sma200"]:
-        raise ValueError("V3 columns must be A=Symbol, B=Price, C=SMA200")
-    found: list[tuple[str, Decimal]] = []
-    seen: set[str] = set()
-    for row in rows[1:]:
-        if len(row) < 4:
-            continue
-        symbol = ticker(row[0])
-        if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,11}", symbol) or symbol in seen:
-            continue
-        price, sma, delta = (parse_decimal(row[i]) for i in (1, 2, 3))
-        if price is None or sma is None or delta is None or price <= 0 or sma <= 0:
-            continue
-        if delta < 0:
-            seen.add(symbol)
-            found.append((symbol, delta))
-    return found
-
-
-def order_dollars(buying_power: object, fraction: Decimal) -> Decimal:
-    available = parse_decimal(buying_power)
-    if available is None or available <= 0:
-        return Decimal("0")
-    return (available * fraction).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-
-
-def order_client_id(day: str, symbol: str) -> str:
-    """Stable per trading day, even if Railway restarts."""
-    return f"v3dip-{day.replace('-', '')}-{symbol.replace('.', '-')}"[:48]
+def number(value):
+    try:
+        d = D(str(value))
+        return d if d.is_finite() else None
+    except (ValueError, TypeError, ArithmeticError):
+        return None
 
 
 class Alpaca:
-    def __init__(self, key: str, secret: str, paper: bool):
-        import requests
-        self.session = requests.Session()
-        self.session.headers.update({
-            "APCA-API-KEY-ID": key,
-            "APCA-API-SECRET-KEY": secret,
-            "Accept": "application/json",
-        })
-        self.base = "https://paper-api.alpaca.markets" if paper else "https://api.alpaca.markets"
+    def __init__(self, cfg):
+        self.http = requests.Session()
+        self.http.headers.update({"APCA-API-KEY-ID": cfg["key"], "APCA-API-SECRET-KEY": cfg["secret"]})
+        self.trading = "https://paper-api.alpaca.markets" if cfg["paper"] else "https://api.alpaca.markets"
+        self.feed = cfg["feed"]
 
-    def call(self, method: str, path: str, *, params=None, payload=None, allow_404=False):
-        response = self.session.request(
-            method, self.base + path, params=params, json=payload, timeout=(5, 30)
-        )
-        if allow_404 and response.status_code == 404:
+    def call(self, method, path, *, data=False, params=None, payload=None, missing_ok=False):
+        base = "https://data.alpaca.markets" if data else self.trading
+        r = self.http.request(method, base + path, params=params, json=payload, timeout=(5, 30))
+        if missing_ok and r.status_code == 404:
             return None
-        response.raise_for_status()
-        return response.json()
+        r.raise_for_status()
+        return r.json()
 
-    def market_open(self) -> bool:
-        return self.call("GET", "/v2/clock")["is_open"] is True
+    def is_open(self):
+        return self.call("GET", "/v2/clock").get("is_open") is True
 
-    def positions(self) -> set[str]:
-        return {ticker(p["symbol"]) for p in self.call("GET", "/v2/positions")}
+    def account(self):
+        a = self.call("GET", "/v2/account")
+        if any(a.get(k) for k in ("account_blocked", "trading_blocked", "trade_suspended_by_user")):
+            raise RuntimeError("Account trading blocked")
+        return a
 
-    def pending_symbols(self) -> set[str]:
-        orders = self.call("GET", "/v2/orders", params={"status": "open", "limit": 500})
-        if len(orders) >= 500:
-            raise RuntimeError("500+ open orders: cannot verify duplicate protection safely")
-        return {ticker(o["symbol"]) for o in orders}
+    def positions(self):
+        return {sym(p["symbol"]) for p in self.call("GET", "/v2/positions")}
 
-    def bought_today(self, symbol: str, trading_day: str) -> bool:
-        # Account-wide check, including filled and canceled buy orders by other bots.
-        start = datetime.combine(date.fromisoformat(trading_day), clock_time.min, tzinfo=DENVER)
+    def open_orders(self):
+        o = self.call("GET", "/v2/orders", params={"status": "open", "limit": 500})
+        if len(o) >= 500:
+            raise RuntimeError("Open orders pagination safety limit reached")
+        return {sym(x["symbol"]) for x in o}
+
+    def recent_orders(self, symbol, since):
         orders = self.call("GET", "/v2/orders", params={
-            "status": "all", "symbols": symbol, "side": "buy",
-            "after": start.isoformat(), "limit": 500,
-        })
+            "status": "all", "symbols": symbol, "after": since.isoformat(),
+            "limit": 500, "direction": "desc"})
         if len(orders) >= 500:
-            raise RuntimeError(f"500+ buy orders for {symbol} today; skipping safely")
-        return any(ticker(o.get("symbol")) == symbol and o.get("side") == "buy" for o in orders)
+            raise RuntimeError("Recent order pagination safety limit reached")
+        return [x for x in orders if sym(x.get("symbol")) == symbol]
 
-    def already_attempted(self, client_id: str) -> bool:
-        result = self.call("GET", "/v2/orders:by_client_order_id",
-                           params={"client_order_id": client_id}, allow_404=True)
-        return result is not None
+    def by_client_id(self, cid):
+        return self.call("GET", "/v2/orders:by_client_order_id",
+                         params={"client_order_id": cid}, missing_ok=True)
 
-    def fractionable_asset(self, symbol: str) -> bool:
-        asset = self.call("GET", "/v2/assets/" + quote(symbol, safe=""), allow_404=True)
-        return bool(asset and asset.get("tradable") and asset.get("fractionable")
-                    and asset.get("status") == "active")
+    def fractionable(self, symbol):
+        a = self.call("GET", "/v2/assets/" + quote(symbol, safe=""), missing_ok=True)
+        return bool(a and a.get("tradable") and a.get("fractionable") and a.get("status") == "active")
 
-    def buying_power(self) -> str:
-        account = self.call("GET", "/v2/account")
-        if any(account.get(f) for f in ("account_blocked", "trading_blocked", "trade_suspended_by_user")):
-            raise RuntimeError("Alpaca account cannot trade")
-        return account["buying_power"]
+    def latest_prices(self, symbols):
+        """Latest regular-session trades only; do not use stale quotes or historical bars."""
+        now = datetime.now(timezone.utc)
+        prices = {}
+        for i in range(0, len(symbols), 40):
+            batch = symbols[i:i+40]
+            snapshots = self.call("GET", "/v2/stocks/snapshots", data=True,
+                                  params={"symbols": ",".join(batch), "feed": self.feed})
+            for symbol, snap in snapshots.items():
+                if symbol not in batch or not isinstance(snap, dict):
+                    continue
+                trade = snap.get("latestTrade") or {}
+                try:
+                    stamp = datetime.fromisoformat(trade["t"].replace("Z", "+00:00"))
+                    price = number(trade["p"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                age = (now - stamp).total_seconds()
+                et = stamp.astimezone(NEW_YORK)
+                if (price is not None and price > 0 and 0 <= age <= 900
+                    and et.date() == now.astimezone(NEW_YORK).date()
+                    and (9, 30) <= (et.hour, et.minute) < (16, 0)):
+                    prices[symbol] = price
+        return prices
 
-    def submit(self, symbol: str, amount: Decimal, client_id: str) -> dict:
+    def submit(self, symbol, amount, cid):
         return self.call("POST", "/v2/orders", payload={
             "symbol": symbol, "notional": str(amount), "side": "buy",
-            "type": "market", "time_in_force": "day", "client_order_id": client_id,
-        })
+            "type": "market", "time_in_force": "day", "client_order_id": cid})
 
 
-def read_v3(session, cfg: Settings) -> list[tuple[str, Decimal]]:
-    # Google Sheets values endpoint returns the calculated numeric value of D.
-    a1 = quote(f"'{cfg.tab.replace(chr(39), chr(39) * 2)}'!A:D", safe="")
-    url = f"https://sheets.googleapis.com/v4/spreadsheets/{cfg.sheet_id}/values/{a1}"
-    response = session.get(url, params={"valueRenderOption": "UNFORMATTED_VALUE"}, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    return negative_dips(data.get("values", []))
+def sheet_signals(session, cfg):
+    tab = cfg["tab"].replace("'", "''")
+    path = quote(f"'{tab}'!A:D", safe="")
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{cfg['sheet_id']}/values/{path}"
+    r = session.get(url, params={"valueRenderOption": "UNFORMATTED_VALUE"}, timeout=30)
+    r.raise_for_status()
+    rows = r.json().get("values", [])
+    if not rows or [str(x).strip().lower() for x in rows[0][:3]] != ["symbol", "price", "sma200"]:
+        raise RuntimeError("Unexpected V3 Sheet header; refusing discovery")
+    result = set()
+    for row in rows[1:]:
+        if len(row) < 4:
+            continue
+        s = sym(row[0]); price = number(row[1]); sma = number(row[2]); delta = number(row[3])
+        if (re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,11}", s) and price is not None
+            and sma is not None and delta is not None and price > 0 and sma > 0 and delta < 0):
+            result.add(s)
+    return result
 
 
-def buy_cycle(session, alpaca: Alpaca, cfg: Settings, today: str) -> dict:
-    if not alpaca.market_open():
-        LOG.info("Market closed: no orders today")
-        return {"status": "market_closed"}
-    signals = read_v3(session, cfg)
-    LOG.info("V3 candidates with D<0: %d", len(signals))
-    results = {"candidates": len(signals), "submitted": [], "simulated": [], "skipped": []}
+def connect(url):
+    conn = psycopg2.connect(url, connect_timeout=10, sslmode="prefer")
+    conn.autocommit = False
+    return conn
 
-    for symbol, delta in signals:
+
+def init_db(conn):
+    with conn, conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS v3_trailing_watchlist (
+            symbol TEXT PRIMARY KEY,
+            first_seen TIMESTAMPTZ NOT NULL,
+            low_price NUMERIC(22,8) NOT NULL CHECK (low_price > 0),
+            last_price NUMERIC(22,8) NOT NULL CHECK (last_price > 0),
+            last_seen TIMESTAMPTZ NOT NULL,
+            status TEXT NOT NULL DEFAULT 'watching' CHECK (status IN ('watching','pending','blocked')),
+            client_order_id TEXT UNIQUE,
+            alpaca_order_id TEXT,
+            note TEXT
+        )""")
+    LOG.info("Persistent watchlist ready")
+
+
+def list_watch(conn):
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM v3_trailing_watchlist ORDER BY first_seen, symbol")
+        return list(cur.fetchall())
+
+
+def update_low(conn, symbol, price):
+    with conn, conn.cursor() as cur:
+        cur.execute("""UPDATE v3_trailing_watchlist SET low_price=LEAST(low_price,%s),
+            last_price=%s,last_seen=now() WHERE symbol=%s AND status='watching'
+            RETURNING low_price""", (price, price, symbol))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def set_status(conn, symbol, status, *, cid=None, oid=None, note=None):
+    with conn, conn.cursor() as cur:
+        cur.execute("""UPDATE v3_trailing_watchlist SET status=%s,
+            client_order_id=COALESCE(%s,client_order_id),
+            alpaca_order_id=COALESCE(%s,alpaca_order_id),note=%s WHERE symbol=%s""",
+            (status, cid, oid, note, symbol))
+
+
+def remove(conn, symbol):
+    with conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM v3_trailing_watchlist WHERE symbol=%s", (symbol,))
+
+
+def discover(conn, alpaca, session, cfg):
+    signals = sheet_signals(session, cfg)
+    held = alpaca.positions(); pending = alpaca.open_orders()
+    existing = {r["symbol"] for r in list_watch(conn)}
+    new = sorted(signals - held - pending - existing)
+    prices = alpaca.latest_prices(new)
+    now = datetime.now(timezone.utc)
+    count = 0
+    for symbol in new:
+        if symbol not in prices:
+            continue
+        # A recently sold stock is not immediately eligible to re-enter the queue.
+        orders = alpaca.recent_orders(symbol, now - timedelta(hours=max(24, cfg["cooldown_hours"])))
+        if any(o.get("side") == "sell" and o.get("status") in ("filled", "partially_filled")
+               and datetime.fromisoformat(o["created_at"].replace("Z", "+00:00")) >=
+               now - timedelta(hours=cfg["cooldown_hours"]) for o in orders):
+            continue
+        # Avoid re-adding symbols bought earlier today by any buyer.
+        start = datetime.combine(now.astimezone(DENVER).date(), datetime.min.time(), tzinfo=DENVER)
+        if any(o.get("side") == "buy" and
+               datetime.fromisoformat(o["created_at"].replace("Z", "+00:00")) >= start for o in orders):
+            continue
+        with conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO v3_trailing_watchlist
+                (symbol,first_seen,low_price,last_price,last_seen)
+                VALUES (%s,now(),%s,%s,now()) ON CONFLICT (symbol) DO NOTHING""",
+                (symbol, prices[symbol], prices[symbol]))
+            count += cur.rowcount
+    LOG.info("Discovery: %d signals; %d new watched; %d total", len(signals), count, len(list_watch(conn)))
+
+
+def reconcile(conn, alpaca, cfg):
+    for row in list_watch(conn):
+        if row["status"] != "pending":
+            continue
+        cid = row["client_order_id"]
         try:
-            if not alpaca.market_open():
-                LOG.warning("Market closed during evaluation; stopping")
-                break
-            # Recheck at order time because other Railway bots share this Alpaca account.
-            if symbol in alpaca.positions():
-                results["skipped"].append((symbol, "already held"))
-                continue
-            if symbol in alpaca.pending_symbols():
-                results["skipped"].append((symbol, "existing open order"))
-                continue
-            if alpaca.bought_today(symbol, today):
-                results["skipped"].append((symbol, "already bought today in account"))
-                continue
-            cid = order_client_id(today, symbol)
-            if alpaca.already_attempted(cid):
-                results["skipped"].append((symbol, "V3 order already attempted today"))
-                continue
-            if not alpaca.fractionable_asset(symbol):
-                results["skipped"].append((symbol, "asset not fractionable/tradable"))
-                continue
-            amount = order_dollars(alpaca.buying_power(), cfg.buy_fraction)
-            if amount < Decimal("1.00"):
-                LOG.info("Buying power insufficient; stopping")
-                break
-            if cfg.dry_run:
-                LOG.info("DRY RUN %s D=%s buy $%s", symbol, delta, amount)
-                results["simulated"].append((symbol, str(amount)))
-                continue
-            order = alpaca.submit(symbol, amount, cid)
-            LOG.info("BUY %s D=%s $%s order_id=%s", symbol, delta, amount, order.get("id"))
-            results["submitted"].append((symbol, str(amount), order.get("id")))
+            order = alpaca.by_client_id(cid)
         except Exception:
-            # Do not automatically retry an order whose submission status is uncertain.
-            LOG.exception("Stopped during %s; checking logs and Alpaca orders is required", symbol)
+            LOG.exception("Order lookup failed for %s; preserving pending", row["symbol"])
+            continue
+        if order is None:
+            # Never automatically retry an uncertain submission.
+            LOG.warning("Unresolved order %s for %s; manual review needed", cid, row["symbol"])
+        elif order.get("status") == "filled":
+            LOG.info("Confirmed fill %s; removing from watchlist", row["symbol"])
+            remove(conn, row["symbol"])
+        elif order.get("status") in ("canceled", "expired", "rejected"):
+            set_status(conn, row["symbol"], "blocked", note="Order not filled; manual review")
+        else:
+            LOG.info("Order for %s remains %s", row["symbol"], order.get("status"))
+
+
+def monitor(conn, alpaca, cfg):
+    reconcile(conn, alpaca, cfg)
+    watching = [r for r in list_watch(conn) if r["status"] == "watching"]
+    if not watching:
+        return
+    prices = alpaca.latest_prices([r["symbol"] for r in watching])
+    held = alpaca.positions(); pending = alpaca.open_orders()
+    for row in watching:
+        symbol = row["symbol"]
+        price = prices.get(symbol)
+        if price is None:
+            LOG.warning("No fresh price for %s; skipping", symbol)
+            continue
+        # Update the low before evaluating trigger; no retroactive price-history claims.
+        low = update_low(conn, symbol, price)
+        if low is None:
+            continue
+        trigger = low * TRIGGER
+        LOG.info("WATCH %s price=%s low=%s trigger=%s", symbol, price, low, trigger)
+        if price < trigger:
+            continue
+        if symbol in held or symbol in pending:
+            LOG.info("Trigger skipped for %s: already held or open order", symbol)
+            continue
+        now = datetime.now(timezone.utc)
+        orders = alpaca.recent_orders(symbol, now - timedelta(hours=max(24, cfg["cooldown_hours"])))
+        start = datetime.combine(now.astimezone(DENVER).date(), datetime.min.time(), tzinfo=DENVER)
+        if any(o.get("side") == "buy" and datetime.fromisoformat(
+                o["created_at"].replace("Z", "+00:00")) >= start for o in orders):
+            LOG.info("Trigger skipped %s: already bought today", symbol)
+            continue
+        if any(o.get("side") == "sell" and o.get("status") in ("filled", "partially_filled")
+               and datetime.fromisoformat(o["created_at"].replace("Z", "+00:00")) >=
+               now - timedelta(hours=cfg["cooldown_hours"]) for o in orders):
+            LOG.info("Trigger skipped %s: post-sale cooldown", symbol)
+            continue
+        if not alpaca.fractionable(symbol):
+            LOG.warning("Trigger skipped %s: not fractionable/tradable", symbol)
+            continue
+        available = number(alpaca.account().get("buying_power"))
+        amount = ((available or D("0")) * cfg["fraction"]).quantize(D("0.01"), rounding=ROUND_DOWN)
+        if amount < D("1"):
+            LOG.info("Insufficient buying power; no orders")
             break
-    return results
-
-
-def run() -> None:
-    from google.auth.transport.requests import AuthorizedSession
-    from google.oauth2 import service_account
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cfg = load_settings()
-    service_account_data = json.loads(cfg.service_account_json)
-    creds = service_account.Credentials.from_service_account_info(
-        service_account_data,
-        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
-    )
-    sheets = AuthorizedSession(creds)
-    alpaca = Alpaca(cfg.key, cfg.secret, cfg.paper)
-    LOG.info("V3 buyer online: 12:30 America/Denver weekdays, paper=%s dry_run=%s", cfg.paper, cfg.dry_run)
-    while True:
-        due = next_cycle(datetime.now(DENVER))
-        LOG.info("Next cycle: %s", due.isoformat())
-        while True:
-            remaining = (due - datetime.now(DENVER)).total_seconds()
-            if remaining <= 0:
-                break
-            time.sleep(min(remaining, 60))
+        if cfg["dry_run"]:
+            LOG.info("DRY RUN TRIGGER %s price=%s low=%s amount=%s", symbol, price, low, amount)
+            continue
+        # Persist the intent BEFORE sending the order. A timeout must never
+        # result in automatic resubmission on the next 10-minute tick.
+        cid = "v3trail-" + uuid.uuid4().hex[:24]
+        set_status(conn, symbol, "pending", cid=cid, note="Intent persisted; reconcile Alpaca")
         try:
-            report = buy_cycle(sheets, alpaca, cfg, due.date().isoformat())
-            LOG.info("Cycle complete: %s", report)
+            order = alpaca.submit(symbol, amount, cid)
+            set_status(conn, symbol, "pending", oid=order.get("id"), note="Submitted; awaiting fill")
+            LOG.info("SUBMITTED %s amount=%s cid=%s", symbol, amount, cid)
         except Exception:
-            LOG.exception("Cycle failed; will wait until next scheduled trading weekday")
+            LOG.exception("Uncertain submission for %s; pending retained, NO automatic retry", symbol)
+
+
+def run():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    cfg = settings()
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(cfg["service_json"]), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    sheets = AuthorizedSession(creds)
+    alpaca = Alpaca(cfg)
+    conn = connect(cfg["database_url"])
+    init_db(conn)
+    discovered_date = None
+    LOG.info("V3.1 online; 10-minute monitoring; paper=%s dry_run=%s", cfg["paper"], cfg["dry_run"])
+    while True:
+        try:
+            local = datetime.now(DENVER)
+            if local.weekday() < 5 and alpaca.is_open():
+                # Discovery after the morning screener, once per day.
+                if (local.hour, local.minute) >= (12, 30) and discovered_date != local.date():
+                    discover(conn, alpaca, sheets, cfg)
+                    discovered_date = local.date()
+                monitor(conn, alpaca, cfg)
+        except (psycopg2.Error, requests.RequestException, Exception):
+            LOG.exception("Cycle failed; no automatic order retry")
+            try:
+                conn.rollback()
+                if conn.closed:
+                    conn = connect(cfg["database_url"])
+            except Exception:
+                LOG.exception("Database reconnect failed")
+        time.sleep(INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
